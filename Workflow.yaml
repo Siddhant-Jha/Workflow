@@ -1,0 +1,77 @@
+name: Revert Commit Across Branches
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_id:
+        description: 'Commit SHA to revert'
+        required: true
+      target_branches:
+        description: 'Comma-separated list of branches to check and revert from (e.g., dev,qa,stg,prod)'
+        required: true
+
+jobs:
+  generate_report:
+    runs-on: ubuntu-latest
+    outputs:
+      branches_containing_commit: ${{ steps.check_commit.outputs.branches }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: Check Commit Presence in Branches
+        id: check_commit
+        run: |
+          IFS=',' read -r -a branches <<< "${{ github.event.inputs.target_branches }}"
+          commit_id=${{ github.event.inputs.commit_id }}
+          branches_with_commit=()
+          for branch in "${branches[@]}"; do
+            if git branch --contains "$commit_id" origin/"$branch"; then
+              branches_with_commit+=("$branch")
+            fi
+          done
+          echo "branches=$(IFS=,; echo "${branches_with_commit[*]}")" >> $GITHUB_OUTPUT
+
+      - name: Display Report
+        run: |
+          echo "The commit ${{ github.event.inputs.commit_id }} is present in the following branches:"
+          echo "${{ steps.check_commit.outputs.branches }}"
+
+  revert_commit:
+    needs: generate_report
+    runs-on: ubuntu-latest
+    if: needs.generate_report.outputs.branches_containing_commit != ''
+    strategy:
+      matrix:
+        branch: ${{ fromJson(needs.generate_report.outputs.branches_containing_commit) }}
+    steps:
+      - name: Checkout Target Branch
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ matrix.branch }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Create Revert Commit
+        run: |
+          git revert --no-edit ${{ github.event.inputs.commit_id }}
+          git push origin HEAD:${{ matrix.branch }}-revert-${{ github.event.inputs.commit_id }}
+
+      - name: Create Pull Request
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const base = '${{ matrix.branch }}';
+            const head = '${{ matrix.branch }}-revert-${{ github.event.inputs.commit_id }}';
+            const commitId = '${{ github.event.inputs.commit_id }}';
+            const prTitle = `Revert commit ${commitId} from ${base}`;
+            const prBody = `This pull request reverts commit ${commitId} from the ${base} branch.`;
+            await github.rest.pulls.create({ owner, repo, title: prTitle, head, base, body: prBody });
