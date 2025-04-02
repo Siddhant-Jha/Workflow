@@ -1,77 +1,78 @@
-name: Revert Commit Across Branches
+name: Multi-Branch Commit Revert
 
-on:
-  workflow_dispatch:
-    inputs:
-      commit_id:
-        description: 'Commit SHA to revert'
-        required: true
-      target_branches:
-        description: 'Comma-separated list of branches to check and revert from (e.g., dev,qa,stg,prod)'
-        required: true
+on: workflow_dispatch: inputs: commit_sha: description: "Commit SHA to find and revert" required: true target_branches: description: "Comma-separated list of branches to revert on (leave blank to only scan)" required: false default: ""
 
-jobs:
-  generate_report:
-    runs-on: ubuntu-latest
-    outputs:
-      branches_containing_commit: ${{ steps.check_commit.outputs.branches }}
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 0
+permissions: contents: write pull-requests: write
 
-      - name: Check Commit Presence in Branches
-        id: check_commit
-        run: |
-          IFS=',' read -r -a branches <<< "${{ github.event.inputs.target_branches }}"
-          commit_id=${{ github.event.inputs.commit_id }}
-          branches_with_commit=()
-          for branch in "${branches[@]}"; do
-            if git branch --contains "$commit_id" origin/"$branch"; then
-              branches_with_commit+=("$branch")
-            fi
-          done
-          echo "branches=$(IFS=,; echo "${branches_with_commit[*]}")" >> $GITHUB_OUTPUT
+jobs: scan_commit: runs-on: ubuntu-latest outputs: dev_contains: ${{ steps.scan.outputs.dev_found }} qa_contains: ${{ steps.scan.outputs.qa_found }} stg_contains: ${{ steps.scan.outputs.stg_found }} prod_contains: ${{ steps.scan.outputs.prod_found }} steps: - name: Checkout code uses: actions/checkout@v3 with: fetch-depth: 0
 
-      - name: Display Report
-        run: |
-          echo "The commit ${{ github.event.inputs.commit_id }} is present in the following branches:"
-          echo "${{ steps.check_commit.outputs.branches }}"
+- name: Find commit in environment branches
+    id: scan
+    run: |
+      set -e
+      commit="${{ github.event.inputs.commit_sha }}"
+      git fetch origin dev:origin/dev qa:origin/qa stg:origin/stg prod:origin/prod
 
-  revert_commit:
-    needs: generate_report
-    runs-on: ubuntu-latest
-    if: needs.generate_report.outputs.branches_containing_commit != ''
-    strategy:
-      matrix:
-        branch: ${{ fromJson(needs.generate_report.outputs.branches_containing_commit) }}
-    steps:
-      - name: Checkout Target Branch
-        uses: actions/checkout@v2
-        with:
-          ref: ${{ matrix.branch }}
-          fetch-depth: 0
+      echo "dev_found=false" >> $GITHUB_OUTPUT
+      echo "qa_found=false" >> $GITHUB_OUTPUT
+      echo "stg_found=false" >> $GITHUB_OUTPUT
+      echo "prod_found=false" >> $GITHUB_OUTPUT
 
-      - name: Configure Git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+      for branch in dev qa stg prod; do
+        if git merge-base --is-ancestor "$commit" "origin/$branch"; then
+          echo "${branch}_found=true" >> $GITHUB_OUTPUT
+        fi
+      done
 
-      - name: Create Revert Commit
-        run: |
-          git revert --no-edit ${{ github.event.inputs.commit_id }}
-          git push origin HEAD:${{ matrix.branch }}-revert-${{ github.event.inputs.commit_id }}
+revert_commit: needs: scan_commit runs-on: ubuntu-latest if: ${{ github.event.inputs.target_branches != '' }} steps: - name: Checkout repository uses: actions/checkout@v3 with: fetch-depth: 0
 
-      - name: Create Pull Request
-        uses: actions/github-script@v6
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const { owner, repo } = context.repo;
-            const base = '${{ matrix.branch }}';
-            const head = '${{ matrix.branch }}-revert-${{ github.event.inputs.commit_id }}';
-            const commitId = '${{ github.event.inputs.commit_id }}';
-            const prTitle = `Revert commit ${commitId} from ${base}`;
-            const prBody = `This pull request reverts commit ${commitId} from the ${base} branch.`;
-            await github.rest.pulls.create({ owner, repo, title: prTitle, head, base, body: prBody });
+- name: Configure Git user
+    run: |
+      git config user.name "GitHub Actions"
+      git config user.email "actions@github.com"
+
+  - name: Revert commit on branches
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    run: |
+      set -e
+      commit="${{ github.event.inputs.commit_sha }}"
+      branches="${{ github.event.inputs.target_branches }}"
+      short_sha="${commit::7}"
+
+      IFS=',' read -ra TARGETS <<< "$branches"
+      for branch in "${TARGETS[@]}"; do
+        branch="$(echo -n "$branch" | xargs)"
+        echo "Processing branch '$branch'..."
+
+        case "$branch" in
+          dev)  found=${{ needs.scan_commit.outputs.dev_contains }} ;;
+          qa)   found=${{ needs.scan_commit.outputs.qa_contains }} ;;
+          stg)  found=${{ needs.scan_commit.outputs.stg_contains }} ;;
+          prod) found=${{ needs.scan_commit.outputs.prod_contains }} ;;
+          *)    found="false" ;;
+        esac
+        if [ "$found" != "true" ]; then
+          echo "Skipping: Commit not found in $branch"
+          continue
+        fi
+
+        git fetch origin "$branch"
+        git switch -c "revert-${short_sha}-${branch}" "origin/$branch"
+
+        if git revert --no-edit "$commit"; then
+          echo "✅ Revert successful on $branch"
+        else
+          echo "⚠️ Revert caused conflicts on $branch"
+          git add .
+          git commit -m "Partial revert of $commit with conflicts (manual resolution needed)"
+        fi
+
+        git push origin "HEAD:revert-${short_sha}-${branch}"
+
+        gh pr create -B "$branch" -H "revert-${short_sha}-${branch}" \
+          --title "Revert commit $short_sha from $branch" \
+          --body "This pull request attempts to revert commit $commit from the **$branch** branch.\n\n⚠️ **Merge conflicts detected. Manual resolution required.**"
+
+        gh pr edit "revert-${short_sha}-${branch}" --add-label "needs-manual-revert" || echo "Could not add label. Ensure it exists."
+
