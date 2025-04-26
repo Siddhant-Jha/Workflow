@@ -1,0 +1,41 @@
+name: "▶ Trigger Personalized Atlantis Plan"
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+jobs:
+  atlantis-plan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Decide which Atlantis plan to trigger"
+        id: decide
+        run: |
+          echo "SOURCE_BRANCH=${{ github.event.pull_request.head.ref }}" >> $GITHUB_ENV
+          echo "TARGET_BRANCH=${{ github.event.pull_request.base.ref }}" >> $GITHUB_ENV
+          echo "AUTHOR=${{ github.event.pull_request.user.login }}" >> $GITHUB_ENV
+          
+          if [[ "${{ github.event.pull_request.head.ref }}" == feature* && "${{ github.event.pull_request.base.ref }}" == "dev" ]]; then
+            echo "PLAN_COMMAND=/atlantis plan -p develop" >> $GITHUB_ENV
+          elif [[ "${{ github.event.pull_request.head.ref }}" == "develop" && "${{ github.event.pull_request.base.ref }}" == "stg" ]]; then
+            echo "PLAN_COMMAND=/atlantis plan -p stg" >> $GITHUB_ENV
+          elif [[ "${{ github.event.pull_request.head.ref }}" == "stg" && "${{ github.event.pull_request.base.ref }}" == "prod" ]]; then
+            echo "PLAN_COMMAND=/atlantis plan -p prod" >> $GITHUB_ENV
+          else
+            echo "PLAN_COMMAND=" >> $GITHUB_ENV
+          fi
+
+      - name: "Signal Atlantis to plan if condition matched"
+        if: env.PLAN_COMMAND != ''
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            Hey @${{ env.AUTHOR }}!  
+            Atlantis has detected your PR movement and is now planning accordingly:
+
+            ```
+            ${{ env.PLAN_COMMAND }}
+            ```
+
+            Stay tuned for the results!
